@@ -25,7 +25,6 @@ DEALINGS IN THE SOFTWARE.
 from __future__ import annotations
 
 import datetime
-import inspect
 import itertools
 from operator import attrgetter
 from typing import Any, Awaitable, Callable, Collection, Dict, List, Optional, TYPE_CHECKING, Tuple, TypeVar, Union
@@ -74,6 +73,8 @@ if TYPE_CHECKING:
         GuildVoiceState as GuildVoiceStatePayload,
         VoiceState as VoiceStatePayload,
     )
+    from .primary_guild import PrimaryGuild
+    from .collectible import Collectible
 
     VocalGuildChannel = Union[VoiceChannel, StageChannel]
 
@@ -188,7 +189,7 @@ def flatten_user(cls: T) -> T:
             # probably a member function by now
             def generate_function(x):
                 # We want sphinx to properly show coroutine functions as coroutines
-                if inspect.iscoroutinefunction(value):
+                if utils._iscoroutinefunction(value):
 
                     async def general(self, *args, **kwargs):  # type: ignore
                         return await getattr(self._user, x)(*args, **kwargs)
@@ -238,7 +239,8 @@ class Member(discord.abc.Messageable, _UserTag):
     ----------
     joined_at: Optional[:class:`datetime.datetime`]
         An aware datetime object that specifies the date and time in UTC that the member joined the guild.
-        If the member left and rejoined the guild, this will be the latest date. In certain cases, this can be ``None``.
+        If the member left and rejoined the guild, this will be the latest date.
+        This can be ``None``, such as when the member is a guest.
     activities: Tuple[Union[:class:`BaseActivity`, :class:`Spotify`]]
         The activities that the user is currently doing.
 
@@ -308,6 +310,8 @@ class Member(discord.abc.Messageable, _UserTag):
         accent_colour: Optional[Colour]
         avatar_decoration: Optional[Asset]
         avatar_decoration_sku_id: Optional[int]
+        primary_guild: PrimaryGuild
+        collectibles: List[Collectible]
 
     def __init__(self, *, data: MemberWithUserPayload, guild: Guild, state: ConnectionState):
         self._state: ConnectionState = state
@@ -451,9 +455,11 @@ class Member(discord.abc.Messageable, _UserTag):
             u.global_name,
             u._public_flags,
             u._avatar_decoration_data['sku_id'] if u._avatar_decoration_data is not None else None,
+            u._primary_guild,
         )
 
         decoration_payload = user.get('avatar_decoration_data')
+        primary_guild_payload = user.get('primary_guild', None)
         # These keys seem to always be available
         modified = (
             user['username'],
@@ -462,16 +468,26 @@ class Member(discord.abc.Messageable, _UserTag):
             user.get('global_name'),
             user.get('public_flags', 0),
             decoration_payload['sku_id'] if decoration_payload is not None else None,
+            primary_guild_payload,
         )
         if original != modified:
             to_return = User._copy(self._user)
-            u.name, u.discriminator, u._avatar, u.global_name, u._public_flags, u._avatar_decoration_data = (
+            (
+                u.name,
+                u.discriminator,
+                u._avatar,
+                u.global_name,
+                u._public_flags,
+                u._avatar_decoration_data,
+                u._primary_guild,
+            ) = (
                 user['username'],
                 user['discriminator'],
                 user['avatar'],
                 user.get('global_name'),
                 user.get('public_flags', 0),
                 decoration_payload,
+                primary_guild_payload,
             )
             # Signal to dispatch on_user_update
             return to_return, u
@@ -798,11 +814,21 @@ class Member(discord.abc.Messageable, _UserTag):
         voice_channel: Optional[VocalGuildChannel] = MISSING,
         timed_out_until: Optional[datetime.datetime] = MISSING,
         bypass_verification: bool = MISSING,
+        avatar: Optional[bytes] = MISSING,
+        banner: Optional[bytes] = MISSING,
+        bio: Optional[str] = MISSING,
         reason: Optional[str] = None,
     ) -> Optional[Member]:
         """|coro|
 
         Edits the member's data.
+
+        .. note::
+
+            To upload an avatar or banner, a :term:`py:bytes-like object` must be passed in that
+            represents the image being uploaded. If this is done through a file
+            then the file must be opened via ``open('some_filename', 'rb')`` and
+            the :term:`py:bytes-like object` is given through the use of ``fp.read()``.
 
         Depending on the parameter passed, this requires different permissions listed below:
 
@@ -859,6 +885,23 @@ class Member(discord.abc.Messageable, _UserTag):
             Indicates if the member should be allowed to bypass the guild verification requirements.
 
             .. versionadded:: 2.2
+        avatar: Optional[:class:`bytes`]
+            A :term:`py:bytes-like object` representing the image to upload. Could be ``None`` to denote no avatar.
+            Only image formats supported for uploading are JPEG, PNG, GIF, and WEBP.
+            This can only be set when editing the bot's own member.
+
+            .. versionadded:: 2.7
+        banner: Optional[:class:`bytes`]
+            A :term:`py:bytes-like object` representing the image to upload. Could be ``None`` to denote no banner.
+            Only image formats supported for uploading are JPEG, PNG, GIF and WEBP..
+            This can only be set when editing the bot's own member.
+
+            .. versionadded:: 2.7
+        bio: Optional[:class:`str`]
+            The new bio for the member. Use ``None`` to remove the bio.
+            This can only be set when editing the bot's own member.
+
+            .. versionadded:: 2.7
 
         reason: Optional[:class:`str`]
             The reason for editing this member. Shows up on the audit log.
@@ -871,6 +914,9 @@ class Member(discord.abc.Messageable, _UserTag):
             The operation failed.
         TypeError
             The datetime object passed to ``timed_out_until`` was not timezone-aware.
+        ValueError
+            You tried to edit the bio, avatar or banner of a member that is not the bot's own member.
+            Or the wrong image format passed for ``avatar`` or ``banner``.
 
         Returns
         --------
@@ -882,13 +928,32 @@ class Member(discord.abc.Messageable, _UserTag):
         guild_id = self.guild.id
         me = self._state.self_id == self.id
         payload: Dict[str, Any] = {}
+        self_payload: Dict[str, Any] = {}
 
         if nick is not MISSING:
             nick = nick or ''
             if me:
-                await http.change_my_nickname(guild_id, nick, reason=reason)
+                self_payload['nick'] = nick
             else:
                 payload['nick'] = nick
+
+        if avatar is not MISSING:
+            if avatar is None:
+                self_payload['avatar'] = None
+            else:
+                self_payload['avatar'] = utils._bytes_to_base64_data(avatar)
+
+        if banner is not MISSING:
+            if banner is None:
+                self_payload['banner'] = None
+            else:
+                self_payload['banner'] = utils._bytes_to_base64_data(banner)
+
+        if bio is not MISSING:
+            self_payload['bio'] = bio or ''
+
+        if not me and self_payload:
+            raise ValueError("Editing the bio, avatar or banner is only for the bot's own member.")
 
         if deafen is not MISSING:
             payload['deaf'] = deafen
@@ -911,7 +976,7 @@ class Member(discord.abc.Messageable, _UserTag):
                 await http.edit_my_voice_state(guild_id, voice_state_payload)
             else:
                 if not suppress:
-                    voice_state_payload['request_to_speak_timestamp'] = datetime.datetime.utcnow().isoformat()
+                    voice_state_payload['request_to_speak_timestamp'] = utils.utcnow().isoformat()
                 await http.edit_voice_state(guild_id, self.id, voice_state_payload)
 
         if voice_channel is not MISSING:
@@ -937,7 +1002,12 @@ class Member(discord.abc.Messageable, _UserTag):
 
         if payload:
             data = await http.edit_member(guild_id, self.id, reason=reason, **payload)
-            return Member(data=data, guild=self.guild, state=self._state)
+        elif self_payload:
+            data = await http.edit_my_member(guild_id, reason=reason, **self_payload)
+        else:
+            return None
+
+        return Member(data=data, guild=self.guild, state=self._state)
 
     async def request_to_speak(self) -> None:
         """|coro|
@@ -967,7 +1037,7 @@ class Member(discord.abc.Messageable, _UserTag):
 
         payload = {
             'channel_id': self.voice.channel.id,
-            'request_to_speak_timestamp': datetime.datetime.utcnow().isoformat(),
+            'request_to_speak_timestamp': utils.utcnow().isoformat(),
         }
 
         if self._state.self_id != self.id:
